@@ -31,7 +31,7 @@ afterEach(() => {
 
 describe('MusicBrainz shared queue timing (real p-queue)', () => {
   it.each([
-    [undefined, undefined, 1000],
+    [undefined, undefined, 1100],
     ['http://mirror.example/ws/2', '25', 25],
   ])('shares the configured interval across clients (%s, %s)', async (url, interval, expected) => {
     vi.setSystemTime(1)
@@ -51,6 +51,25 @@ describe('MusicBrainz shared queue timing (real p-queue)', () => {
     await vi.advanceTimersByTimeAsync(expected * 2)
     await Promise.all(requests)
     expect(times).toEqual([1, expected + 1])
+  })
+
+  it('never starts a call less than one interval after a late-starting one', async () => {
+    vi.resetModules()
+    const { createMusicBrainzClient } = await import('@/core/clients/musicbrainz')
+    const times: number[] = []
+    mockFetch.mockImplementation(async (url: string) => {
+      times.push(Date.now())
+      const query = new URL(url).searchParams.get('query')
+      // A is slow, so B starts late in the second 1100 ms window.
+      if (query === 'A') await new Promise((resolve) => setTimeout(resolve, 1900))
+      return jsonOk({ artists: [] })
+    })
+    const client = createMusicBrainzClient()
+    const requests = ['A', 'B', 'C'].map((query) => client.searchArtist(query))
+    await vi.advanceTimersByTimeAsync(10_000)
+    await Promise.all(requests)
+    // A fixed window started C at 2200, 300 ms after B.
+    expect(times).toEqual([0, 1900, 3000])
   })
 
   it('keeps one in-flight request across clients when the mirror interval is zero', async () => {
@@ -123,15 +142,16 @@ describe('MusicBrainz shared queue timing (real p-queue)', () => {
       const seenForQuery = fetches.filter((f) => f.query === query).length
       fetches.push({ query, t: Date.now() })
       // Caller A's first attempt fails transiently (forces a backoff + retry);
-      // every other fetch (A's retry, all of B) succeeds.
+      // every other fetch (A's retry, all of B) succeeds. A 502 is retried
+      // without throttling the queue, so B's timing shows only the slot.
       if (query === 'AAA' && seenForQuery === 0) {
-        return new Response('', { status: 503 })
+        return new Response('', { status: 502 })
       }
       return jsonOk({ artists: [] })
     })
 
     const client = createMusicBrainzClient()
-    const pA = client.searchArtist('AAA') // 503 then retry
+    const pA = client.searchArtist('AAA') // 502 then retry
     const pB = client.searchArtist('BBB') // succeeds
 
     await vi.advanceTimersByTimeAsync(5000)
@@ -151,6 +171,108 @@ describe('MusicBrainz shared queue timing (real p-queue)', () => {
     // the slot). Pre-fix, A held the slot through its in-slot sleep, so B's
     // fetch could not run until A's whole retry cycle finished -> b.t >= aRetry.t.
     expect(b?.t).toBeLessThan(aRetry?.t ?? Number.POSITIVE_INFINITY)
+  })
+})
+
+describe('MusicBrainz adaptive pacing (real p-queue)', () => {
+  // Every query in `failing` answers its first fetch with `failure`; all other
+  // fetches succeed. Returns the fetch log in start order.
+  async function run(failing: Record<string, () => Response>, queries: string[]) {
+    vi.resetModules()
+    const { createMusicBrainzClient } = await import('@/core/clients/musicbrainz')
+    const fetches: Array<{ query: string; t: number }> = []
+    mockFetch.mockImplementation(async (url: string) => {
+      const query = new URL(url).searchParams.get('query') ?? ''
+      const seen = fetches.some((f) => f.query === query)
+      fetches.push({ query, t: Date.now() })
+      const failure = failing[query]
+      return failure && !seen ? failure() : jsonOk({ artists: [] })
+    })
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    const client = createMusicBrainzClient()
+    const requests = queries.map((query) => client.searchArtist(query))
+    await vi.advanceTimersByTimeAsync(120_000)
+    await Promise.all(requests)
+    return fetches
+  }
+
+  it('a 503 without Retry-After widens the spacing for the next queued call', async () => {
+    const fetches = await run({ A: () => new Response('', { status: 503 }) }, ['A', 'B'])
+    expect(fetches.map((f) => f.query)).toEqual(['A', 'B', 'A'])
+    // B is a different caller. Without adaptive pacing it ran one interval
+    // (1100 ms) after A's 503; now the whole queue waits one extra step.
+    expect(fetches[1]?.t).toBe(2200)
+  })
+
+  it('a 503 with Retry-After delays the next queued call, not just the retry', async () => {
+    const throttled = () => new Response('', { status: 503, headers: { 'Retry-After': '5' } })
+    const fetches = await run({ A: throttled }, ['A', 'B'])
+    expect(fetches.map((f) => f.query)).toEqual(['A', 'B', 'A'])
+    expect(fetches[1]?.t).toBe(5000)
+  })
+
+  it('does not widen the spacing for a non-throttling 502', async () => {
+    const fetches = await run({ A: () => new Response('', { status: 502 }) }, ['A', 'B'])
+    expect(fetches[1]).toEqual({ query: 'B', t: 1100 })
+  })
+
+  it('narrows the spacing back to the configured interval as calls succeed', async () => {
+    const queries = Array.from({ length: 14 }, (_, i) => `q${i}`)
+    const fetches = await run({ q0: () => new Response('', { status: 503 }) }, queries)
+    const gaps = fetches.slice(1).map((f, i) => f.t - (fetches[i]?.t ?? 0))
+    // One 503 adds one 1100 ms step; each success removes 110 ms of it.
+    expect(gaps.slice(0, 11)).toEqual([
+      2200, 2090, 1980, 1870, 1760, 1650, 1540, 1430, 1320, 1210, 1100,
+    ])
+    expect(new Set(gaps.slice(10))).toEqual(new Set([1100]))
+  })
+
+  it('doubles the extra spacing on back-to-back throttles, up to eight steps', async () => {
+    vi.resetModules()
+    const { createMusicBrainzClient } = await import('@/core/clients/musicbrainz')
+    const times: number[] = []
+    mockFetch.mockImplementation(async () => {
+      times.push(Date.now())
+      return new Response('', { status: 429 })
+    })
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    const client = createMusicBrainzClient()
+    const requests = ['a', 'b', 'c', 'd', 'e'].map((query) =>
+      expect(client.searchArtist(query)).rejects.toThrow(/MusicBrainz HTTP 429/),
+    )
+    await vi.advanceTimersByTimeAsync(60_000)
+    const gaps = times.slice(1, 6).map((t, i) => t - (times[i] ?? 0))
+    expect(gaps).toEqual([2200, 3300, 5500, 9900, 9900])
+    await vi.runAllTimersAsync()
+    await Promise.all(requests)
+  })
+
+  it('lets a queued caller abort while the queue is held', async () => {
+    vi.resetModules()
+    const { createMusicBrainzClient } = await import('@/core/clients/musicbrainz')
+    const fetches: Array<{ query: string; t: number }> = []
+    mockFetch.mockImplementation(async (url: string) => {
+      const query = new URL(url).searchParams.get('query') ?? ''
+      fetches.push({ query, t: Date.now() })
+      return query === 'A' && fetches.length === 1
+        ? new Response('', { status: 503 })
+        : jsonOk({ artists: [] })
+    })
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    const client = createMusicBrainzClient()
+    const controller = new AbortController()
+    const a = client.searchArtist('A')
+    const b = client.searchArtist('B', { signal: controller.signal })
+    const rejected = expect(b).rejects.toMatchObject({ name: 'AbortError' })
+    const c = client.searchArtist('C')
+    // A's 503 holds the queue until 2200 ms; B is still queued at 1500 ms.
+    await vi.advanceTimersByTimeAsync(1500)
+    controller.abort()
+    await rejected
+    await vi.advanceTimersByTimeAsync(10_000)
+    await Promise.all([a, c])
+    expect(fetches.map((f) => f.query)).toEqual(['A', 'C', 'A'])
+    expect(fetches[1]?.t).toBe(2200)
   })
 })
 
@@ -178,14 +300,14 @@ describe('MusicBrainz caller cancellation', () => {
     const controller = new AbortController()
     const catalog = client.getReleaseGroups('cancelled', undefined, { signal: controller.signal })
     const rejected = expect(catalog).rejects.toMatchObject({ name: 'AbortError' })
-    await vi.advanceTimersByTimeAsync(pages * 1000)
+    await vi.advanceTimersByTimeAsync(pages * 1100)
     controller.abort()
     await rejected
     const victim = client.searchArtist('victim')
     await vi.advanceTimersByTimeAsync(5000)
     await victim
     expect(fetches.filter(({ path }) => path.endsWith('/release-group'))).toHaveLength(pages)
-    expect(fetches.at(-1)).toEqual({ path: '/ws/2/artist/', t: (pages + 1) * 1000 })
+    expect(fetches.at(-1)).toEqual({ path: '/ws/2/artist/', t: (pages + 1) * 1100 })
   })
 
   it('aborts an active fetch without retrying or fetching subsequent pages', async () => {

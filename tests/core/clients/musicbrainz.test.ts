@@ -6,6 +6,7 @@ import {
   type MBRelation,
   type MBSearchResult,
   parseYear,
+  resetMusicBrainzPacingForTests,
 } from '@/core/clients/musicbrainz'
 import {
   MUSICBRAINZ_CACHE_TTL_MS,
@@ -26,8 +27,14 @@ vi.stubGlobal('fetch', mockFetch)
 
 vi.mock('p-queue', () => {
   const mockAdd = vi.fn((fn: () => unknown) => fn())
-  const MockPQueue = vi.fn().mockImplementation(function (this: { add: typeof mockAdd }) {
+  const MockPQueue = vi.fn().mockImplementation(function (this: {
+    add: typeof mockAdd
+    pause: () => void
+    start: () => void
+  }) {
     this.add = mockAdd
+    this.pause = () => {}
+    this.start = () => {}
   })
   ;(MockPQueue as unknown as { mockAdd: typeof mockAdd }).mockAdd = mockAdd
   return { default: MockPQueue }
@@ -122,6 +129,8 @@ function groups(start: number, length: number) {
 beforeEach(() => {
   cache = createReleaseGroupCache()
   vi.clearAllMocks()
+  // The pacer is module state; a 503 in one test must not slow the next.
+  resetMusicBrainzPacingForTests()
 })
 
 describe('parseYear', () => {
@@ -157,21 +166,27 @@ describe('createMusicBrainzClient', () => {
             signal: expect.any(AbortSignal),
           }),
         )
-        expect(PQueue).toHaveBeenCalledWith({ concurrency: 1, interval: 50, intervalCap: 1 })
+        expect(PQueue).toHaveBeenCalledWith({
+          concurrency: 1,
+          interval: 50,
+          intervalCap: 1,
+          strict: true,
+        })
       } finally {
         vi.unstubAllEnvs()
         vi.resetModules()
       }
     })
 
-    it('creates a shared PQueue with concurrency:1, interval:1000, intervalCap:1', async () => {
+    it('creates a shared strict PQueue with concurrency:1, interval:1100, intervalCap:1', async () => {
       vi.resetModules()
       const { default: FreshPQueue } = await import('p-queue')
       await import('@/core/clients/musicbrainz')
       expect(FreshPQueue).toHaveBeenCalledWith({
         concurrency: 1,
-        interval: 1000,
+        interval: 1100,
         intervalCap: 1,
+        strict: true,
       })
     })
 

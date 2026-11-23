@@ -9,6 +9,8 @@ vi.mock('p-queue', () => ({
     add(fn: () => unknown) {
       return fn()
     }
+    pause() {}
+    start() {}
   },
 }))
 

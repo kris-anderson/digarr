@@ -177,11 +177,76 @@ function parseRetryAfterMs(header: string | null): number | null {
 // Single shared rate gate. MusicBrainz enforces ~1 req/s per consumer; every
 // subsystem (pipeline, library sync, discovery modes, routes) funnels through
 // this one queue so concurrent runs can't sum past the ceiling and trigger 503s.
+// The window slides (strict), so two calls never start less than one interval
+// apart. With a fixed window, a call that started late in its window (after a
+// slow response) could be followed as soon as the next window opened.
 const sharedQueue = new PQueue({
   concurrency: 1,
   interval: envConfig.musicbrainzIntervalMs,
   intervalCap: 1,
+  strict: envConfig.musicbrainzIntervalMs > 0,
 })
+
+const THROTTLE_STATUSES = new Set([429, 503])
+const MAX_EXTRA_SPACING_STEPS = 8
+const SPACING_DECAY_DIVISOR = 10
+
+// Adaptive spacing on top of the queue interval. When MusicBrainz is busy it can
+// reject every other request even while Digarr stays under the documented
+// limit, so a fixed interval keeps feeding 503s. A 429 or 503 doubles the extra
+// spacing (starting at one step, capped at eight), and each success removes a
+// tenth of a step. A Retry-After holds the queue until it passes. Holding
+// pauses the whole queue between calls, so it slows every caller, keeps
+// priorities, and lets queued callers abort as before.
+function createMusicBrainzPacer(queue: Pick<PQueue, 'pause' | 'start'>, intervalMs: number) {
+  const step = Math.max(intervalMs, BASE_BACKOFF_MS)
+  const maxExtraMs = step * MAX_EXTRA_SPACING_STEPS
+  const decayMs = Math.max(Math.round(step / SPACING_DECAY_DIVISOR), 1)
+  let extraMs = 0
+  let resumeAt = 0
+  let resumeTimer: ReturnType<typeof setTimeout> | undefined
+
+  function holdUntil(when: number): void {
+    const now = Date.now()
+    if (when <= now || when <= resumeAt) return
+    resumeAt = when
+    queue.pause()
+    clearTimeout(resumeTimer)
+    resumeTimer = setTimeout(() => {
+      resumeTimer = undefined
+      queue.start()
+    }, when - now)
+  }
+
+  return {
+    // Runs inside the queue slot, before the next call can start.
+    record(res: Response, startedAt: number): void {
+      if (res.ok) {
+        extraMs = Math.max(extraMs - decayMs, 0)
+      } else if (THROTTLE_STATUSES.has(res.status)) {
+        extraMs = Math.min(Math.max(extraMs * 2, step), maxExtraMs)
+      }
+      if (extraMs > 0) holdUntil(startedAt + intervalMs + extraMs)
+      if (!res.ok && TRANSIENT_STATUSES.has(res.status)) {
+        const retryAfter = parseRetryAfterMs(res.headers.get('retry-after'))
+        if (retryAfter) holdUntil(Date.now() + retryAfter)
+      }
+    },
+    reset(): void {
+      clearTimeout(resumeTimer)
+      resumeTimer = undefined
+      resumeAt = 0
+      extraMs = 0
+      queue.start()
+    },
+  }
+}
+
+const sharedPacer = createMusicBrainzPacer(sharedQueue, envConfig.musicbrainzIntervalMs)
+
+export function resetMusicBrainzPacingForTests(): void {
+  sharedPacer.reset()
+}
 
 const DEFAULT_RELEASE_TYPES = ['album', 'ep', 'single'] as const
 
@@ -279,10 +344,15 @@ export function createMusicBrainzClient(
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
       signal?.throwIfAborted()
       try {
-        const res = (await queue.add(() => fetchOnce(path, signal), {
-          priority,
-          signal,
-        })) as Response
+        const res = (await queue.add(
+          async () => {
+            const startedAt = Date.now()
+            const response = await fetchOnce(path, signal)
+            sharedPacer.record(response, startedAt)
+            return response
+          },
+          { priority, signal },
+        )) as Response
         signal?.throwIfAborted()
 
         if (res.ok) {
